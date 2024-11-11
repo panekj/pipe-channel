@@ -95,12 +95,13 @@
 //! the program will panic. This should be rare, although not completely unexpected
 //! (e.g. program can run out of file descriptors).
 
-use std::mem::{self, MaybeUninit};
 use std::fmt;
-use std::slice;
 use std::marker::PhantomData;
+use std::mem::{self, MaybeUninit};
+use std::os::fd::BorrowedFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::slice;
 use std::sync::mpsc::{RecvError, SendError};
-use std::os::unix::io::{RawFd, AsRawFd, IntoRawFd, FromRawFd};
 
 /// The sending half of a channel.
 pub struct Sender<T> {
@@ -112,7 +113,7 @@ pub struct Sender<T> {
 }
 
 /// The receiving half of a channel.
-pub struct Receiver<T>{
+pub struct Receiver<T> {
     fd: RawFd,
     // models the recv() method
     variance: PhantomData<fn() -> T>,
@@ -122,19 +123,28 @@ pub struct Receiver<T>{
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        nix::unistd::close(self.fd).unwrap();
+        #[cfg(feature = "nix")]
+        ::nix::unistd::close(self.fd).unwrap();
+        #[cfg(feature = "rustix")]
+        unsafe {
+            ::rustix::io::close(self.fd);
+        }
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        nix::unistd::close(self.fd).unwrap();
+        #[cfg(feature = "nix")]
+        ::nix::unistd::close(self.fd).unwrap();
+        #[cfg(feature = "rustix")]
+        unsafe {
+            ::rustix::io::close(self.fd);
+        }
     }
 }
 
 unsafe impl<T: Send> Send for Sender<T> {}
 unsafe impl<T: Send> Send for Receiver<T> {}
-
 
 /// Create a new pipe-based channel.
 ///
@@ -154,17 +164,27 @@ unsafe impl<T: Send> Send for Receiver<T> {}
 /// handle.join().unwrap();
 /// ```
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    #[cfg(feature = "nix")]
     let flags = nix::fcntl::OFlag::from_bits(libc::O_CLOEXEC).unwrap();
+    #[cfg(feature = "nix")]
     let fd = nix::unistd::pipe2(flags).unwrap();
+
+    #[cfg(feature = "rustix")]
+    let fd = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+
     (
-        Sender::new(fd.1),
-        Receiver::new(fd.0),
+        Sender::new(fd.1.into_raw_fd()),
+        Receiver::new(fd.0.into_raw_fd()),
     )
 }
 
 impl<T> Sender<T> {
     fn new(fd: RawFd) -> Self {
-        Sender { fd, variance: PhantomData, not_send: PhantomData }
+        Sender {
+            fd,
+            variance: PhantomData,
+            not_send: PhantomData,
+        }
     }
 
     /// Send data to the corresponding `Receiver`.
@@ -212,17 +232,27 @@ impl<T> Sender<T> {
         if mem::size_of::<T>() > 0 {
             // TODO: once constexpr is stable, change this to
             // let mut s: [u8; mem::size_of::<T>()] = mem::transmute(t);
-            s = unsafe {
-                slice::from_raw_parts(&t as *const T as *const u8, mem::size_of::<T>())
-            };
+            s = unsafe { slice::from_raw_parts(&t as *const T as *const u8, mem::size_of::<T>()) };
         }
 
         let mut n = 0;
         while n < s.len() {
-            match nix::unistd::write(self.fd, &s[n..]) {
+            #[cfg(feature = "nix")]
+            match nix::unistd::write(unsafe { BorrowedFd::borrow_raw(self.fd) }, &s[n..]) {
                 Ok(count) => n += count,
                 Err(nix::errno::Errno::EPIPE) => return Err(SendError(t)),
-                e => { e.unwrap(); }
+                e => {
+                    e.unwrap();
+                }
+            }
+
+            #[cfg(feature = "rustix")]
+            match rustix::io::write(unsafe { BorrowedFd::borrow_raw(self.fd) }, &s[n..]) {
+                Ok(count) => n += count,
+                Err(rustix::io::Errno::PIPE) => return Err(SendError(t)),
+                e => {
+                    e.unwrap();
+                }
             }
         }
 
@@ -233,7 +263,11 @@ impl<T> Sender<T> {
 
 impl<T> Receiver<T> {
     fn new(fd: RawFd) -> Self {
-        Receiver { fd, variance: PhantomData, not_send: PhantomData }
+        Receiver {
+            fd,
+            variance: PhantomData,
+            not_send: PhantomData,
+        }
     }
 
     /// Receive data sent by the corresponding `Sender`.
@@ -286,10 +320,22 @@ impl<T> Receiver<T> {
 
             let mut n = 0;
             while n < s.len() {
+                #[cfg(feature = "nix")]
                 match nix::unistd::read(self.fd, &mut s[n..]) {
                     Ok(0) => return Err(RecvError),
                     Ok(count) => n += count,
-                    e => { e.unwrap(); }
+                    e => {
+                        e.unwrap();
+                    }
+                }
+
+                #[cfg(feature = "rustix")]
+                match rustix::io::read(rustix::fd::BorrowedFd::borrow_raw(self.fd), &mut s[n..]) {
+                    Ok(0) => return Err(RecvError),
+                    Ok(count) => n += count,
+                    e => {
+                        e.unwrap();
+                    }
                 }
             }
 
@@ -325,11 +371,15 @@ impl<T> Receiver<T> {
 
 // AsRawFd
 impl<T> AsRawFd for Sender<T> {
-    fn as_raw_fd(&self) -> RawFd { self.fd }
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
 }
 
 impl<T> AsRawFd for Receiver<T> {
-    fn as_raw_fd(&self) -> RawFd { self.fd }
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
 }
 
 // IntoRawFd
@@ -365,17 +415,13 @@ impl<T> FromRawFd for Receiver<T> {
 // Debug
 impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Sender")
-            .field("fd", &self.fd)
-            .finish()
+        f.debug_struct("Sender").field("fd", &self.fd).finish()
     }
 }
 
 impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Receiver")
-            .field("fd", &self.fd)
-            .finish()
+        f.debug_struct("Receiver").field("fd", &self.fd).finish()
     }
 }
 
@@ -520,9 +566,9 @@ mod tests {
         impl Large {
             fn new() -> Large {
                 let mut res = [0; LARGE_SIZE];
-                for i in 0..(res.len()) {
+                (0..(res.len())).for_each(|i| {
                     res[i] = i * i;
-                }
+                });
                 Large(res)
             }
         }
@@ -554,7 +600,7 @@ mod tests {
 
     #[test]
     fn raw_fd() {
-        use std::os::unix::io::{AsRawFd, IntoRawFd, FromRawFd};
+        use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
         let (mut tx, rx) = channel();
         let fd = rx.into_raw_fd();
