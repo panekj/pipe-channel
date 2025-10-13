@@ -95,16 +95,17 @@
 //! the program will panic. This should be rare, although not completely unexpected
 //! (e.g. program can run out of file descriptors).
 
-use std::mem::{self, MaybeUninit};
 use std::fmt;
-use std::slice;
 use std::marker::PhantomData;
+use std::mem::{self, ManuallyDrop, MaybeUninit};
+use std::os::fd::OwnedFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::slice;
 use std::sync::mpsc::{RecvError, SendError};
-use std::os::unix::io::{RawFd, AsRawFd, IntoRawFd, FromRawFd};
 
 /// The sending half of a channel.
 pub struct Sender<T> {
-    fd: RawFd,
+    fd: OwnedFd,
     // models the send() method
     variance: PhantomData<fn(T)>,
     // opt out of Send
@@ -112,29 +113,16 @@ pub struct Sender<T> {
 }
 
 /// The receiving half of a channel.
-pub struct Receiver<T>{
-    fd: RawFd,
+pub struct Receiver<T> {
+    fd: OwnedFd,
     // models the recv() method
     variance: PhantomData<fn() -> T>,
     // opt out of Send
     not_send: PhantomData<*const ()>,
 }
 
-impl<T> Drop for Sender<T> {
-    fn drop(&mut self) {
-        nix::unistd::close(self.fd).unwrap();
-    }
-}
-
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        nix::unistd::close(self.fd).unwrap();
-    }
-}
-
 unsafe impl<T: Send> Send for Sender<T> {}
 unsafe impl<T: Send> Send for Receiver<T> {}
-
 
 /// Create a new pipe-based channel.
 ///
@@ -155,16 +143,17 @@ unsafe impl<T: Send> Send for Receiver<T> {}
 /// ```
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let flags = nix::fcntl::OFlag::from_bits(libc::O_CLOEXEC).unwrap();
-    let fd = nix::unistd::pipe2(flags).unwrap();
-    (
-        Sender::new(fd.1),
-        Receiver::new(fd.0),
-    )
+    let (r_fd, w_fd) = nix::unistd::pipe2(flags).unwrap();
+    (Sender::new(w_fd), Receiver::new(r_fd))
 }
 
 impl<T> Sender<T> {
-    fn new(fd: RawFd) -> Self {
-        Sender { fd, variance: PhantomData, not_send: PhantomData }
+    fn new(fd: OwnedFd) -> Self {
+        Sender {
+            fd,
+            variance: PhantomData,
+            not_send: PhantomData,
+        }
     }
 
     /// Send data to the corresponding `Receiver`.
@@ -212,17 +201,17 @@ impl<T> Sender<T> {
         if mem::size_of::<T>() > 0 {
             // TODO: once constexpr is stable, change this to
             // let mut s: [u8; mem::size_of::<T>()] = mem::transmute(t);
-            s = unsafe {
-                slice::from_raw_parts(&t as *const T as *const u8, mem::size_of::<T>())
-            };
+            s = unsafe { slice::from_raw_parts(&t as *const T as *const u8, mem::size_of::<T>()) };
         }
 
         let mut n = 0;
         while n < s.len() {
-            match nix::unistd::write(self.fd, &s[n..]) {
+            match nix::unistd::write(&self.fd, &s[n..]) {
                 Ok(count) => n += count,
                 Err(nix::errno::Errno::EPIPE) => return Err(SendError(t)),
-                e => { e.unwrap(); }
+                e => {
+                    e.unwrap();
+                }
             }
         }
 
@@ -232,8 +221,12 @@ impl<T> Sender<T> {
 }
 
 impl<T> Receiver<T> {
-    fn new(fd: RawFd) -> Self {
-        Receiver { fd, variance: PhantomData, not_send: PhantomData }
+    fn new(fd: OwnedFd) -> Self {
+        Receiver {
+            fd,
+            variance: PhantomData,
+            not_send: PhantomData,
+        }
     }
 
     /// Receive data sent by the corresponding `Sender`.
@@ -275,26 +268,26 @@ impl<T> Receiver<T> {
     /// assert_eq!(rx.recv(), Err(RecvError));
     /// ```
     pub fn recv(&mut self) -> Result<T, RecvError> {
-        unsafe {
-            // TODO: once constexpr is stable, change this to
-            // let mut s: [u8; mem::size_of::<T>()] = mem::uninitialized();
-            let mut t = MaybeUninit::<T>::uninit();
-            let mut s: &mut [u8] = &mut [0];
-            if mem::size_of::<T>() > 0 {
-                s = slice::from_raw_parts_mut(t.as_mut_ptr() as *mut u8, mem::size_of::<T>())
-            }
+        // TODO: once constexpr is stable, change this to
+        // let mut s: [u8; mem::size_of::<T>()] = mem::uninitialized();
+        let mut t = MaybeUninit::<T>::uninit();
+        let mut s: &mut [u8] = &mut [0];
+        if mem::size_of::<T>() > 0 {
+            s = unsafe { slice::from_raw_parts_mut(t.as_mut_ptr() as *mut u8, mem::size_of::<T>()) }
+        }
 
-            let mut n = 0;
-            while n < s.len() {
-                match nix::unistd::read(self.fd, &mut s[n..]) {
-                    Ok(0) => return Err(RecvError),
-                    Ok(count) => n += count,
-                    e => { e.unwrap(); }
+        let mut n = 0;
+        while n < s.len() {
+            match nix::unistd::read(&self.fd, &mut s[n..]) {
+                Ok(0) => return Err(RecvError),
+                Ok(count) => n += count,
+                e => {
+                    e.unwrap();
                 }
             }
-
-            Ok(t.assume_init())
         }
+
+        Ok(unsafe { t.assume_init() })
     }
 
     /// Get an iterator over data sent through the channel.
@@ -318,64 +311,64 @@ impl<T> Receiver<T> {
     /// let v2: Vec<_> = (10..1024).collect();
     /// assert_eq!(v1, v2);
     /// ```
-    pub fn iter(&mut self) -> Iter<T> {
+    pub fn iter(&mut self) -> Iter<'_, T> {
         self.into_iter()
     }
 }
 
 // AsRawFd
 impl<T> AsRawFd for Sender<T> {
-    fn as_raw_fd(&self) -> RawFd { self.fd }
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
 }
 
 impl<T> AsRawFd for Receiver<T> {
-    fn as_raw_fd(&self) -> RawFd { self.fd }
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
 }
 
 // IntoRawFd
 impl<T> IntoRawFd for Sender<T> {
     fn into_raw_fd(self) -> RawFd {
-        let fd = self.fd;
-        mem::forget(self);
-        fd
+        let me = ManuallyDrop::new(self);
+        let fd: OwnedFd = unsafe { std::ptr::read(&me.fd) };
+        fd.into_raw_fd()
     }
 }
 
 impl<T> IntoRawFd for Receiver<T> {
     fn into_raw_fd(self) -> RawFd {
-        let fd = self.fd;
-        mem::forget(self);
-        fd
+        let me = ManuallyDrop::new(self);
+        let fd: OwnedFd = unsafe { std::ptr::read(&me.fd) };
+        fd.into_raw_fd()
     }
 }
 
 // FromRawFd
 impl<T> FromRawFd for Sender<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Sender::new(fd)
+        Sender::new(OwnedFd::from_raw_fd(fd))
     }
 }
 
 impl<T> FromRawFd for Receiver<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Receiver::new(fd)
+        Receiver::new(OwnedFd::from_raw_fd(fd))
     }
 }
 
 // Debug
 impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Sender")
-            .field("fd", &self.fd)
-            .finish()
+        f.debug_struct("Sender").field("fd", &self.fd).finish()
     }
 }
 
 impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Receiver")
-            .field("fd", &self.fd)
-            .finish()
+        f.debug_struct("Receiver").field("fd", &self.fd).finish()
     }
 }
 
@@ -502,7 +495,7 @@ mod tests {
         use std::os::unix::io::AsRawFd;
 
         let (tx, _) = channel::<i32>();
-        let s1 = format!("Sender {{ fd: {:?} }}", tx.as_raw_fd());
+        let s1 = format!("Sender {{ fd: OwnedFd {{ fd: {:?} }} }}", tx.as_raw_fd());
         let s2 = format!("{:?}", tx);
         assert_eq!(s1, s2);
     }
@@ -554,7 +547,7 @@ mod tests {
 
     #[test]
     fn raw_fd() {
-        use std::os::unix::io::{AsRawFd, IntoRawFd, FromRawFd};
+        use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
         let (mut tx, rx) = channel();
         let fd = rx.into_raw_fd();
